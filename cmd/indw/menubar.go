@@ -35,13 +35,18 @@ func cmdMenubar(ctx context.Context, args []string) error {
 }
 
 func menubarRender(ctx context.Context) error {
+	// Resolve our own absolute path once. SwiftBar's bash= actions don't
+	// inherit the user shell's PATH, so we must hand them a fully-qualified
+	// path or the click is a silent no-op.
+	exe := selfExe()
+
 	api, err := newAPI()
 	if err != nil {
 		// Don't blow up the menu bar — render an error line.
 		fmt.Println("⚠ | sfimage=indianrupeesign.circle.fill color=#ef4444")
 		fmt.Println("---")
 		fmt.Println("Not logged in or API error | color=#ef4444")
-		fmt.Printf("%s | bash=indw param1=login terminal=true\n", "Run `indw login`")
+		fmt.Printf("Login (opens browser) | bash=%s param1=login terminal=true\n", exe)
 		return nil
 	}
 	cfg, _ := config.Load()
@@ -142,9 +147,25 @@ func menubarRender(ctx context.Context) error {
 	fmt.Println("---")
 	fmt.Printf("Refresh | refresh=true color=%s\n", mb.HeaderColor)
 	fmt.Printf("Open INDmoney | href=%s color=%s\n", mb.OpenURL, mb.HeaderColor)
-	fmt.Printf("Run alert poll now | bash=indw param1=run-once terminal=false refresh=true color=%s\n", mb.HeaderColor)
-	fmt.Printf("Show recent alerts | bash=indw param1=logs terminal=true color=%s\n", mb.HeaderColor)
+	fmt.Printf("Run alert poll now | bash=%s param1=run-once terminal=false refresh=true color=%s\n", exe, mb.HeaderColor)
+	fmt.Printf("Show recent alerts | bash=%s param1=logs terminal=true color=%s\n", exe, mb.HeaderColor)
+	fmt.Printf("Re-login | bash=%s param1=login param2=-f terminal=true color=%s\n", exe, mb.HeaderColor)
 	return nil
+}
+
+// selfExe returns the absolute path to this binary. SwiftBar's bash= actions
+// run with a minimal PATH so we hand them the full path. Falls back to "indw"
+// if resolution fails — better a broken click than a render error.
+func selfExe() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "indw"
+	}
+	abs, err := filepath.Abs(exe)
+	if err != nil {
+		return exe
+	}
+	return abs
 }
 
 // renderSIPSection prints a section listing all active SIPs (stock + MF).

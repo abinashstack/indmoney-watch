@@ -1,0 +1,17 @@
+# Build artifacts
+/indw
+/dist/
+*.test
+*.out
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local-only
+/.env
+/scratch/

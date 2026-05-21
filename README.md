@@ -4,6 +4,12 @@ A macOS CLI + menu-bar app that watches your [INDmoney](https://www.indmoney.com
 
 > **Status**: works on the author's account. The INDmoney MCP server is the authoritative source for tool availability — if they change schemas, this tool will need updating. PRs welcome.
 
+<p align="center">
+  <img src="docs/menubar-dropdown.png" alt="indw menu bar dropdown" width="320"/>
+  &nbsp;&nbsp;
+  <img src="docs/menubar-watchlist.png" alt="indw watchlist submenu expanded" width="520"/>
+</p>
+
 ## Features
 
 - **Portfolio alerts** — notifies on intraday total P&L swings, asset-class moves, per-holding swings (vs day and vs cost basis)

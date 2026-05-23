@@ -375,7 +375,19 @@ func menubarInstall() error {
 exec "%s" menubar
 `, exe, exe)
 
-	if err := os.WriteFile(pluginPath, []byte(script), 0o755); err != nil {
+	// 0700: owner read/write/execute only. SwiftBar plugin scripts run with
+	// your indw binary on a timer, which means anyone who can write to this
+	// file can swap your indw with theirs and execute code as you. Tightening
+	// to owner-only closes the LaunchAgent-swap pattern that's a known macOS
+	// malware vector. SwiftBar runs as the same user, so 0700 doesn't break it.
+	//
+	// Note: WriteFile honours the perm only on create; if the file already
+	// exists from an older `indw menubar install` it keeps the old (looser)
+	// perm. Explicit Chmod after Write fixes upgrades.
+	if err := os.WriteFile(pluginPath, []byte(script), 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(pluginPath, 0o700); err != nil {
 		return err
 	}
 

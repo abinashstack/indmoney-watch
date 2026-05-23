@@ -46,8 +46,8 @@ Usage:
   indw state                           Show last snapshot + debounce state
   indw paths                           Show all on-disk locations
   indw menubar                         Print SwiftBar menu plugin output (renders portfolio in macOS menu bar)
-  indw menubar install                 Install as a SwiftBar plugin (prompts to install SwiftBar if missing)
-`)
+  indw menubar install                 Install as a SwiftBar plugin (prompts to install SwiftBar if missing)`)
+	fmt.Fprintln(os.Stderr)
 }
 
 func main() {

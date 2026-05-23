@@ -25,6 +25,13 @@ const (
 	Scopes       = "portfolio:read market:read"
 )
 
+// httpClient is a bounded-timeout client used for all OAuth/registration
+// requests. http.DefaultClient has no Timeout, so a hung TLS handshake or a
+// stalled response body would block the CLI indefinitely (and, when invoked
+// from launchd, hold up subsequent run-once cycles). 30 s is generous for an
+// OAuth endpoint while still letting users notice and Ctrl-C.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 // ClientCreds is the result of dynamic client registration.
 type ClientCreds struct {
 	ClientID     string `json:"client_id"`
@@ -53,7 +60,7 @@ func Register(ctx context.Context, redirectURI string) (*ClientCreds, error) {
 	})
 	req, _ := http.NewRequestWithContext(ctx, "POST", RegisterURL, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +213,7 @@ func Refresh(ctx context.Context, t *Tokens) (*Tokens, error) {
 func tokenRequest(ctx context.Context, form url.Values) (*Tokens, error) {
 	req, _ := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

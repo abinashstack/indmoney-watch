@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -14,27 +15,59 @@ import (
 
 // Keychain stores tokens in macOS login keychain via the `security` CLI.
 // Service: indmoney-watch, Account: tokens.
-const (
+//
+// The vars are non-const so tests can point at a scratch service name and
+// avoid clobbering a real user session in the login keychain.
+var (
 	kcService = "indmoney-watch"
 	kcAccount = "tokens"
 )
 
+// SaveTokens writes the token bundle to Keychain via `security -i` with the
+// secret encoded as a hex string passed to `-X`. Two reasons:
+//
+//  1. argv exposure — without `-i`, the only way to set a password is
+//     `add-generic-password -w SECRET …`, putting SECRET on argv where any
+//     user's `ps` can briefly see it. `-i` reads sub-commands from stdin, so
+//     `-w SECRET` becomes a stdin token, not a process argument. (Same trick
+//     as `gh` CLI / zalando/go-keyring.)
+//
+//  2. line/quote handling — `security -i` is line-oriented and its quoting
+//     rules don't match a POSIX shell: embedded newlines terminate the
+//     command, and backslash escapes are not processed inside double quotes.
+//     A token can legitimately contain any byte, so we encode it as hex and
+//     pass it via `-X`, which only ever sees `[0-9a-f]`.
 func SaveTokens(t *oauth.Tokens) error {
 	b, err := json.Marshal(t)
 	if err != nil {
 		return err
 	}
-	// Delete first (security CLI errors on duplicate); ignore failure.
-	_ = exec.Command("security", "delete-generic-password",
-		"-s", kcService, "-a", kcAccount).Run()
-	cmd := exec.Command("security", "add-generic-password",
-		"-s", kcService,
-		"-a", kcAccount,
-		"-w", string(b),
-		"-U")
+	hexBlob := hex.EncodeToString(b)
+	// `security -i` accepts one command per line on stdin and exits on EOF.
+	// Delete first (security errors on duplicate without -U) then add with
+	// -U so an upgrade path also works. Service/account are fixed constants
+	// (no user input), so quoting them is unnecessary, but we keep them
+	// double-quoted for defense in depth in case the constants ever change.
+	cmds := fmt.Sprintf(
+		"delete-generic-password -s %q -a %q\nadd-generic-password -s %q -a %q -U -X %s\n",
+		kcService, kcAccount,
+		kcService, kcAccount, hexBlob,
+	)
+	cmd := exec.Command("security", "-i")
+	cmd.Stdin = strings.NewReader(cmds)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("keychain add: %w (%s)", err, strings.TrimSpace(string(out)))
+		// Don't include `out` in errors — it may echo our argv.
+		// security -i prints "SecKeychainItemCreateFromContent ... -25299" if
+		// the delete failed because the item didn't exist; that's fine and
+		// the subsequent add-generic-password with -U will succeed. We only
+		// fail here if the *exec itself* failed.
+		return fmt.Errorf("keychain save: %w", err)
+	}
+	// Treat unknown-error lines from the add (not the pre-delete) as failure.
+	if strings.Contains(string(out), "add-generic-password:") &&
+		strings.Contains(string(out), "error") {
+		return fmt.Errorf("keychain save: %s", strings.TrimSpace(string(out)))
 	}
 	return nil
 }

@@ -7,7 +7,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -17,6 +19,12 @@ import (
 	"sync"
 	"time"
 )
+
+// ErrNeedsLogin signals that the OAuth server has rejected our refresh token
+// (RFC 6749 invalid_grant) and silent recovery is impossible. The user must
+// run `indw login -f` to start a fresh authorization flow. Daemons should
+// treat this as a terminal error for the cycle and surface it to the user.
+var ErrNeedsLogin = errors.New("oauth: refresh rejected, re-login required")
 
 const (
 	AuthorizeURL = "https://mcp.indmoney.com/authorize"
@@ -133,7 +141,11 @@ func Login(ctx context.Context, creds *ClientCreds, redirectURI string) (*Tokens
 			errParam := r.URL.Query().Get("error")
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			if errParam != "" {
-				_, _ = io.WriteString(w, "<h1>Login failed</h1><p>"+errParam+"</p>")
+				// errParam is attacker-controllable: anyone who can navigate the
+				// user's browser to http://127.0.0.1:47823/callback?error=… during
+				// the login window injects HTML otherwise. html.EscapeString covers
+				// the body context (& < > " ').
+				_, _ = io.WriteString(w, "<h1>Login failed</h1><p>"+html.EscapeString(errParam)+"</p>")
 				once.Do(func() { resCh <- result{err: fmt.Errorf("oauth error: %s", errParam)} })
 				return
 			}
@@ -220,6 +232,22 @@ func tokenRequest(ctx context.Context, form url.Values) (*Tokens, error) {
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
+		// Try to parse the standard OAuth error response (RFC 6749 §5.2). If
+		// the server says invalid_grant, the refresh token is dead and silent
+		// recovery isn't possible — wrap ErrNeedsLogin so callers can match
+		// via errors.Is and trigger a re-login flow.
+		var oe struct {
+			Error            string `json:"error"`
+			ErrorDescription string `json:"error_description"`
+		}
+		_ = json.Unmarshal(rb, &oe)
+		if oe.Error == "invalid_grant" {
+			desc := oe.ErrorDescription
+			if desc == "" {
+				desc = "refresh token rejected"
+			}
+			return nil, fmt.Errorf("token http %d: %s: %w", resp.StatusCode, desc, ErrNeedsLogin)
+		}
 		return nil, fmt.Errorf("token http %d: %s", resp.StatusCode, string(rb))
 	}
 	var raw struct {

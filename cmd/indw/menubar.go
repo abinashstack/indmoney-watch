@@ -40,7 +40,7 @@ func menubarRender(ctx context.Context) error {
 	// path or the click is a silent no-op.
 	exe := selfExe()
 
-	api, err := newAPI()
+	api, err := newAPI(ctx)
 	if err != nil {
 		// Don't blow up the menu bar — render an error line.
 		fmt.Println("⚠ | sfimage=indianrupeesign.circle.fill color=#ef4444")

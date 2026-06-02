@@ -92,5 +92,5 @@ func Save(s *State) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, b, 0o600)
+	return config.WriteFileAtomic(p, b, 0o600)
 }

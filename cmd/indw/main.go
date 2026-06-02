@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/abinashstack/indmoney-watch/internal/config"
 	"github.com/abinashstack/indmoney-watch/internal/indmoney"
 	"github.com/abinashstack/indmoney-watch/internal/mcpclient"
+	"github.com/abinashstack/indmoney-watch/internal/notify"
 	"github.com/abinashstack/indmoney-watch/internal/oauth"
 	"github.com/abinashstack/indmoney-watch/internal/state"
 	"github.com/abinashstack/indmoney-watch/internal/store"
@@ -24,7 +26,7 @@ import (
 
 const (
 	mcpEndpoint   = "https://mcp.indmoney.com/mcp"
-	launchdLabel  = "com.abinash.indmoney-watch"
+	launchdLabel  = "indmoney-watch"
 )
 
 func usage() {
@@ -153,20 +155,20 @@ func cmdLogin(ctx context.Context) error {
 	return nil
 }
 
-func newAPI() (*indmoney.API, error) {
+func newAPI(ctx context.Context) (*indmoney.API, error) {
 	ts, err := store.NewTokenSource()
 	if err != nil {
 		return nil, fmt.Errorf("load tokens: %w (run `indw login`)", err)
 	}
 	c := mcpclient.New(mcpEndpoint, ts)
-	if err := c.Initialize(context.Background()); err != nil {
+	if err := c.Initialize(ctx); err != nil {
 		return nil, fmt.Errorf("mcp initialize: %w", err)
 	}
 	return indmoney.New(c), nil
 }
 
 func cmdStatus(ctx context.Context) error {
-	api, err := newAPI()
+	api, err := newAPI(ctx)
 	if err != nil {
 		return err
 	}
@@ -199,7 +201,7 @@ func cmdStatus(ctx context.Context) error {
 }
 
 func cmdWatchlist(ctx context.Context) error {
-	api, err := newAPI()
+	api, err := newAPI(ctx)
 	if err != nil {
 		return err
 	}
@@ -254,7 +256,7 @@ func cmdWatchlist(ctx context.Context) error {
 }
 
 func cmdSIPs(ctx context.Context) error {
-	api, err := newAPI()
+	api, err := newAPI(ctx)
 	if err != nil {
 		return err
 	}
@@ -354,10 +356,14 @@ func cmdClearTarget(args []string) error {
 }
 
 func cmdRunOnce(ctx context.Context) error {
-	api, err := newAPI()
-	if err != nil {
-		return err
-	}
+	// Cap the entire cycle. The HTTP client has a 30 s per-request timeout but
+	// the engine fires ~10–20 sequential MCP calls, so a degraded upstream can
+	// otherwise drag a single run past the next launchd slot. 2 minutes is
+	// generous for a healthy poll and leaves headroom before the next 5 min
+	// fire.
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -366,8 +372,40 @@ func cmdRunOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	api, err := newAPI(ctx)
+	if err != nil {
+		return notifyIfNeedsLogin(err, st)
+	}
 	eng := alert.NewEngine(api, cfg, st)
-	return eng.Run(ctx)
+	if err := eng.Run(ctx); err != nil {
+		return notifyIfNeedsLogin(err, st)
+	}
+	return nil
+}
+
+// notifyIfNeedsLogin surfaces oauth.ErrNeedsLogin to the user via a macOS
+// banner — once per 6h cooldown so the daemon doesn't spam every cycle while
+// the refresh token is dead. The original error is returned unchanged so the
+// launchd log still records the underlying cause.
+func notifyIfNeedsLogin(err error, st *state.State) error {
+	if !errors.Is(err, oauth.ErrNeedsLogin) {
+		return err
+	}
+	const key = "auth:needs-login"
+	const cooldown = 6 * time.Hour
+	now := time.Now()
+	if last, ok := st.LastFired[key]; ok && now.Sub(last) < cooldown {
+		return err
+	}
+	st.LastFired[key] = now
+	_ = state.Save(st)
+	_ = notify.MacBanner(
+		"INDmoney session expired",
+		"Refresh token rejected",
+		"Run `indw login -f` to re-authenticate.",
+	)
+	return err
 }
 
 func cmdConfig() error {
@@ -386,6 +424,19 @@ func cmdConfig() error {
 }
 
 // ---- launchd ----
+
+// plistEscape XML-escapes a string for safe substitution inside a
+// <string>…</string> element of the launchd plist we generate. The two values
+// we substitute (`exe` from os.Executable, `logFile` under $HOME/.config) are
+// trusted in normal use, but a path containing `<` or `&` would corrupt the
+// plist, and a maliciously-crafted path could close the <string> tag and
+// inject directives like RunAtLoad=true. Defense in depth: cheaper to escape
+// every substitution than to reason about whether each input is safe.
+func plistEscape(s string) string {
+	var buf strings.Builder
+	_ = xml.EscapeText(&buf, []byte(s))
+	return buf.String()
+}
 
 func plistPath() (string, error) {
 	home, err := os.UserHomeDir()
@@ -429,7 +480,7 @@ func cmdStart() error {
   </dict>
 </dict>
 </plist>
-`, launchdLabel, exe, calendarSlots(), logFile, logFile)
+`, launchdLabel, plistEscape(exe), calendarSlots(), plistEscape(logFile), plistEscape(logFile))
 
 	pp, err := plistPath()
 	if err != nil {
@@ -451,7 +502,7 @@ func cmdStart() error {
 	}
 	fmt.Println("Installed launchd agent:", pp)
 	fmt.Println("Logs:", logFile)
-	fmt.Println("It will run every 10 minutes between 09:00–16:00 IST, Mon–Fri.")
+	fmt.Println("It will run every 5 minutes between 09:00–16:00 IST, Mon–Fri.")
 	return nil
 }
 
@@ -470,7 +521,7 @@ func cmdStop() error {
 	return nil
 }
 
-// calendarSlots returns StartCalendarInterval entries for every 10 minutes
+// calendarSlots returns StartCalendarInterval entries for every 5 minutes
 // between 09:00 and 16:00 IST on Mon-Fri. macOS launchd uses local time,
 // so we offset for IST (+05:30) → local. The host's local TZ matters; we
 // emit IST minute-of-day slots based on the host's current offset.
@@ -483,9 +534,9 @@ func calendarSlots() string {
 	}
 	var sb strings.Builder
 	weekdays := []int{1, 2, 3, 4, 5} // Mon-Fri
-	// 09:00 to 15:50 IST in 10-min steps (last fire 15:50).
+	// 09:00 to 15:55 IST in 5-min steps (last fire 15:55).
 	for h := 9; h <= 15; h++ {
-		for m := 0; m < 60; m += 10 {
+		for m := 0; m < 60; m += 5 {
 			istT := time.Date(2026, 1, 5, h, m, 0, 0, istLoc) // any Monday
 			localT := istT.Local()
 			for _, wd := range weekdays {

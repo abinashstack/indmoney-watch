@@ -188,7 +188,40 @@ func Save(c *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, b, 0o600)
+	return WriteFileAtomic(p, b, 0o600)
+}
+
+// WriteFileAtomic writes data to path via a sibling tempfile + rename, so a
+// concurrent reader (e.g. the SwiftBar menubar plugin) never observes a
+// partial file, and a crash mid-write cannot leave a truncated target.
+// Same semantics as os.WriteFile otherwise. The tempfile lives in the same
+// directory as path so rename is atomic on the same filesystem.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // Pretty-print Targets for CLI status output.

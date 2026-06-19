@@ -30,7 +30,7 @@
 
 ## 📚 Contents
 
-[Features](#-features) · [Quickstart](#-quickstart) · [Architecture](#-architecture) · [Commands](#-commands) · [Configuration](#-configuration) · [How it works](#-how-it-works) · [Contributing](#-contributing) · [Caveats](#-caveats) · [License](#-license)
+[Features](#-features) · [Quickstart](#-quickstart) · [Architecture](#-architecture) · [Commands](#-commands) · [Configuration](#-configuration) · [How it works](#-how-it-works) · [Contributing](#-contributing) · [Caveats](#-caveats) · [Star history](#-star-history) · [License](#-license)
 
 ## ✨ Features
 
@@ -197,6 +197,16 @@ When opening a PR:
 - **Personal tool, not a product.** It works on my account and probably yours, but INDmoney can change MCP schemas at any time.
 - **Not financial advice.** Alerts are noisy on volatile days; tune thresholds in config to your tolerance.
 - **No rate limiting from this client.** Polling cadence is set by you (default 10 min during market hours). Don't be a bad citizen.
+
+## ⭐ Star history
+
+<a href="https://star-history.com/#abinashstack/indmoney-watch&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=abinashstack/indmoney-watch&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=abinashstack/indmoney-watch&type=Date" />
+    <img alt="Star history" src="https://api.star-history.com/svg?repos=abinashstack/indmoney-watch&type=Date" />
+  </picture>
+</a>
 
 ## 📄 License
 

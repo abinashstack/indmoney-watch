@@ -13,6 +13,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/abinashstack/indmoney-watch/internal/alert"
 	"github.com/abinashstack/indmoney-watch/internal/config"
@@ -25,8 +27,10 @@ import (
 )
 
 const (
-	mcpEndpoint   = "https://mcp.indmoney.com/mcp"
-	launchdLabel  = "indmoney-watch"
+	mcpEndpoint  = "https://mcp.indmoney.com/mcp"
+	launchdLabel = "indmoney-watch"
+	// pollEvery is the launchd agent's cadence during market hours.
+	pollEvery = 10 * time.Minute
 )
 
 func usage() {
@@ -41,7 +45,7 @@ Usage:
   indw set-target SYMBOL below PRICE   Add price target (below)
   indw clear-target SYMBOL             Remove targets for a symbol
   indw run-once                        Single poll (alerts fire if thresholds hit)
-  indw start                           Install launchd agent (poll every 10 min, 09:00–16:00 IST)
+  indw start                           Install launchd agent (poll every 10 min, Mon–Fri 09:00–16:00 IST)
   indw stop                            Uninstall launchd agent
   indw config                          Print config path and contents
   indw logs [-f]                       Show launchd agent log (-f to follow)
@@ -118,19 +122,13 @@ func cmdLogin(ctx context.Context) error {
 		}
 	}
 	if !force {
-		if t, err := store.LoadTokens(); err == nil {
-			if time.Until(t.ExpiresAt) > 60*time.Second {
-				fmt.Println("Already logged in. Token valid until", t.ExpiresAt.Local().Format("2006-01-02 15:04 MST"))
+		// Go through TokenSource so a refresh here takes the same
+		// cross-process lock as the daemon and menu bar plugin.
+		if ts, err := store.NewTokenSource(); err == nil {
+			if _, err := ts.AccessToken(ctx); err == nil {
+				fmt.Println("Logged in. Token valid until", ts.ExpiresAt().Local().Format("2006-01-02 15:04 MST"))
 				fmt.Println("Use `indw login --force` to re-authenticate.")
 				return nil
-			}
-			if t.RefreshToken != "" {
-				if nt, rerr := oauth.Refresh(ctx, t); rerr == nil {
-					if serr := store.SaveTokens(nt); serr == nil {
-						fmt.Println("Refreshed existing session. Token valid until", nt.ExpiresAt.Local().Format("2006-01-02 15:04 MST"))
-						return nil
-					}
-				}
 			}
 			fmt.Println("Existing tokens expired and could not be refreshed; starting full login.")
 		}
@@ -188,13 +186,13 @@ func cmdStatus(ctx context.Context) error {
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "By asset type:")
 	for _, inv := range snap.Investments {
-		fmt.Fprintf(tw, "  %s\t₹%.0f\t%+.2f%%\n", inv.AssetType, inv.CurrentValue, inv.ReturnPercentage)
+		fmt.Fprintf(tw, "  %s\t₹%.0f\t%+.2f%%\n", termSafe(inv.AssetType), inv.CurrentValue, inv.ReturnPercentage)
 	}
 	if len(snap.Liabilities.CreditCards) > 0 {
 		fmt.Fprintln(tw)
 		fmt.Fprintln(tw, "Credit cards:")
 		for _, cc := range snap.Liabilities.CreditCards {
-			fmt.Fprintf(tw, "  %s\t₹%.2f due %s\n", cc.Name, cc.TotalDue, cc.DueDate)
+			fmt.Fprintf(tw, "  %s\t₹%.2f due %s\n", termSafe(cc.Name), cc.TotalDue, termSafe(cc.DueDate))
 		}
 	}
 	return tw.Flush()
@@ -221,8 +219,8 @@ func cmdWatchlist(ctx context.Context) error {
 			if details, err := api.IndianStockDetails(ctx, indKeys); err == nil {
 				for k, ent := range details {
 					fmt.Fprintf(tw, "IND\t%s\t%s\t₹%.2f\t%+.2f\t%s\n",
-						ent.Basic.Symbol, trunc(ent.Basic.Name, 30),
-						ent.Stats.LivePrice, ent.Stats.DayChangePct, k)
+						termSafe(ent.Basic.Symbol), trunc(ent.Basic.Name, 30),
+						ent.Stats.LivePrice, ent.Stats.DayChangePct, termSafe(k))
 				}
 			}
 		}
@@ -241,8 +239,8 @@ func cmdWatchlist(ctx context.Context) error {
 			if details, err := api.USStockDetails(ctx, tickers); err == nil {
 				for tkr, ent := range details {
 					fmt.Fprintf(tw, "US\t%s\t%s\t$%.2f\t%+.2f\t%s\n",
-						ent.Basic.Symbol, trunc(ent.Basic.Name, 30),
-						ent.Stats.LivePrice, ent.Stats.DayChangePct, tkr)
+						termSafe(ent.Basic.Symbol), trunc(ent.Basic.Name, 30),
+						ent.Stats.LivePrice, ent.Stats.DayChangePct, termSafe(tkr))
 				}
 			} else {
 				fmt.Fprintf(tw, "US\t-\tcouldn't fetch details (%v)\t\t\t\n", err)
@@ -309,7 +307,7 @@ func printSIPRow(tw *tabwriter.Writer, kind string, s indmoney.SIP) {
 		next = "-"
 	}
 	fmt.Fprintf(tw, "%s\t%s\t₹%.0f\t%s\t%s\t%s\n",
-		kind, trunc(s.DisplayName(), 32), s.AmountValue(), freq, next, status)
+		kind, trunc(s.DisplayName(), 32), s.AmountValue(), termSafe(freq), termSafe(next), status)
 }
 
 func cmdSetTarget(args []string) error {
@@ -359,8 +357,7 @@ func cmdRunOnce(ctx context.Context) error {
 	// Cap the entire cycle. The HTTP client has a 30 s per-request timeout but
 	// the engine fires ~10–20 sequential MCP calls, so a degraded upstream can
 	// otherwise drag a single run past the next launchd slot. 2 minutes is
-	// generous for a healthy poll and leaves headroom before the next 5 min
-	// fire.
+	// generous for a healthy poll and leaves headroom before the next fire.
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
@@ -480,7 +477,7 @@ func cmdStart() error {
   </dict>
 </dict>
 </plist>
-`, launchdLabel, plistEscape(exe), calendarSlots(), plistEscape(logFile), plistEscape(logFile))
+`, launchdLabel, plistEscape(exe), calendarSlots(time.Now(), time.Local), plistEscape(logFile), plistEscape(logFile))
 
 	pp, err := plistPath()
 	if err != nil {
@@ -495,14 +492,18 @@ func cmdStart() error {
 	// Bootstrap.
 	uid := os.Getuid()
 	target := fmt.Sprintf("gui/%d", uid)
-	_ = exec.Command("launchctl", "bootout", target, pp).Run()
-	out, err := exec.Command("launchctl", "bootstrap", target, pp).CombinedOutput()
+	_ = exec.Command("/bin/launchctl", "bootout", target, pp).Run()
+	out, err := exec.Command("/bin/launchctl", "bootstrap", target, pp).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("launchctl bootstrap: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 	fmt.Println("Installed launchd agent:", pp)
 	fmt.Println("Logs:", logFile)
-	fmt.Println("It will run every 5 minutes between 09:00–16:00 IST, Mon–Fri.")
+	fmt.Printf("It will run every %d minutes between 09:00–16:00 IST, Mon–Fri.\n", int(pollEvery.Minutes()))
+	if _, off := time.Now().Zone(); off != 5*3600+30*60 {
+		fmt.Println("Note: the schedule is converted to your local time zone at install time.")
+		fmt.Println("If your clock changes for daylight saving, re-run `indw start`.")
+	}
 	return nil
 }
 
@@ -513,7 +514,7 @@ func cmdStop() error {
 	}
 	uid := os.Getuid()
 	target := fmt.Sprintf("gui/%d", uid)
-	_ = exec.Command("launchctl", "bootout", target, pp).Run()
+	_ = exec.Command("/bin/launchctl", "bootout", target, pp).Run()
 	if err := os.Remove(pp); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -521,49 +522,60 @@ func cmdStop() error {
 	return nil
 }
 
-// calendarSlots returns StartCalendarInterval entries for every 5 minutes
-// between 09:00 and 16:00 IST on Mon-Fri. macOS launchd uses local time,
-// so we offset for IST (+05:30) → local. The host's local TZ matters; we
-// emit IST minute-of-day slots based on the host's current offset.
-func calendarSlots() string {
-	// Convert IST hours to host-local hours.
-	// 09:00 IST → host local time of 09:00 IST.
+// calendarSlots returns StartCalendarInterval entries for every pollEvery
+// between 09:00 and 16:00 IST on Mon–Fri, expressed in host-local time
+// (launchd only understands local time).
+//
+// Each slot is converted individually, weekday included: for hosts far from
+// IST the market window falls on a different local day (09:00 IST Monday is
+// Sunday evening in the US), so reusing the IST weekday would schedule polls
+// on the wrong days. The conversion uses the IST week containing now, so the
+// UTC offset matches the host's current daylight-saving state.
+func calendarSlots(now time.Time, local *time.Location) string {
 	istLoc, err := time.LoadLocation("Asia/Kolkata")
 	if err != nil {
 		istLoc = time.FixedZone("IST", 5*3600+30*60)
 	}
+	t := now.In(istLoc)
+	daysSinceMonday := (int(t.Weekday()) + 6) % 7
+	monday := time.Date(t.Year(), t.Month(), t.Day()-daysSinceMonday, 0, 0, 0, 0, istLoc)
+
 	var sb strings.Builder
-	weekdays := []int{1, 2, 3, 4, 5} // Mon-Fri
-	// 09:00 to 15:55 IST in 5-min steps (last fire 15:55).
-	for h := 9; h <= 15; h++ {
-		for m := 0; m < 60; m += 5 {
-			istT := time.Date(2026, 1, 5, h, m, 0, 0, istLoc) // any Monday
-			localT := istT.Local()
-			for _, wd := range weekdays {
-				sb.WriteString(fmt.Sprintf(
-					"    <dict><key>Weekday</key><integer>%d</integer><key>Hour</key><integer>%d</integer><key>Minute</key><integer>%d</integer></dict>\n",
-					wd, localT.Hour(), localT.Minute(),
-				))
-			}
+	for d := 0; d < 5; d++ { // Mon–Fri IST
+		start := monday.AddDate(0, 0, d).Add(9 * time.Hour)
+		end := monday.AddDate(0, 0, d).Add(16 * time.Hour)
+		for slot := start; !slot.After(end); slot = slot.Add(pollEvery) {
+			lt := slot.In(local)
+			fmt.Fprintf(&sb,
+				"    <dict><key>Weekday</key><integer>%d</integer><key>Hour</key><integer>%d</integer><key>Minute</key><integer>%d</integer></dict>\n",
+				int(lt.Weekday()), lt.Hour(), lt.Minute(),
+			)
 		}
-	}
-	// One last slot at 16:00 IST.
-	istT := time.Date(2026, 1, 5, 16, 0, 0, 0, istLoc)
-	localT := istT.Local()
-	for _, wd := range weekdays {
-		sb.WriteString(fmt.Sprintf(
-			"    <dict><key>Weekday</key><integer>%d</integer><key>Hour</key><integer>%d</integer><key>Minute</key><integer>%d</integer></dict>\n",
-			wd, localT.Hour(), localT.Minute(),
-		))
 	}
 	return sb.String()
 }
 
+// trunc shortens s to at most n characters (runes, so multi-byte characters
+// are never split) and strips terminal control characters.
 func trunc(s string, n int) string {
-	if len(s) <= n {
+	s = termSafe(s)
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	r := []rune(s)
+	return string(r[:n-1]) + "…"
+}
+
+// termSafe replaces control characters (including ESC, which starts ANSI
+// sequences) with spaces, so names from INDmoney can't rewrite the terminal,
+// set its title, or break tabwriter columns.
+func termSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
 }
 
 // ---- inspection commands ----
@@ -585,7 +597,7 @@ func cmdLogs(args []string) error {
 		}
 	}
 	tailArgs = append(tailArgs, logFile)
-	c := exec.Command("tail", tailArgs...)
+	c := exec.Command("/usr/bin/tail", tailArgs...)
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	return c.Run()

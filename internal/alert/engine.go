@@ -120,11 +120,10 @@ func (e *Engine) Run(ctx context.Context) error {
 			if cc.DueDate == "" {
 				continue
 			}
-			due, err := time.Parse("2006-01-02", cc.DueDate)
+			daysLeft, err := daysUntil(cc.DueDate, now)
 			if err != nil {
 				continue
 			}
-			daysLeft := int(math.Floor(time.Until(due).Hours() / 24))
 			if daysLeft >= 0 && daysLeft <= e.cfg.CreditCardDueWarningDays {
 				e.fire(now, "cc-due:"+cc.Name+":"+cc.DueDate,
 					fmt.Sprintf("%s due in %dd", cc.Name, daysLeft),
@@ -140,6 +139,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.checkSIPs(ctx, now)
 	}
 
+	e.pruneLastFired(now)
 	e.st.LastSnapshot = now
 	return state.Save(e.st)
 }
@@ -155,7 +155,12 @@ func (e *Engine) checkIndianWatchlist(ctx context.Context, now time.Time) {
 	}
 	indKeys := make([]string, 0, len(stocks))
 	for _, s := range stocks {
-		indKeys = append(indKeys, s.IndKey)
+		if s.IndKey != "" {
+			indKeys = append(indKeys, s.IndKey)
+		}
+	}
+	if len(indKeys) == 0 {
+		return
 	}
 	details, err := e.api.IndianStockDetails(ctx, indKeys)
 	if err != nil {
@@ -280,8 +285,7 @@ func (e *Engine) applySIPs(now time.Time, kind string, sips []indmoney.SIP) {
 		// 3. Due-soon — fire when next_execution_date is within the window.
 		// Date-scoped alert key so it fires once per installment cycle.
 		if e.cfg.SIPDueWarningDays > 0 && nextDate != "" {
-			if due, err := time.Parse("2006-01-02", nextDate); err == nil {
-				daysLeft := int(math.Floor(time.Until(due).Hours() / 24))
+			if daysLeft, err := daysUntil(nextDate, now); err == nil {
 				if daysLeft >= 0 && daysLeft <= e.cfg.SIPDueWarningDays {
 					e.fire(now, "sip-due:"+key+":"+nextDate,
 						fmt.Sprintf("SIP %s due in %dd", name, daysLeft),
@@ -341,6 +345,41 @@ func (e *Engine) fire(now time.Time, key, title, subtitle, msg string) {
 		fmt.Printf("[notify error] %v: %s — %s\n", err, title, msg)
 	} else {
 		fmt.Printf("[alert] %s | %s | %s\n", title, subtitle, msg)
+	}
+}
+
+// daysUntil returns the number of calendar days from now's local date to
+// date (YYYY-MM-DD): 0 means today, 1 tomorrow, negative means past.
+//
+// Both sides are compared as local calendar dates. Parsing with time.Parse
+// would yield midnight UTC (05:30 IST), making a bill due tomorrow read as
+// "due in 0d" and one due today read as overdue during market hours.
+func daysUntil(date string, now time.Time) (int, error) {
+	loc := now.Location()
+	due, err := time.ParseInLocation("2006-01-02", date, loc)
+	if err != nil {
+		return 0, err
+	}
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	// Round, not truncate: a DST transition makes a calendar day 23 or 25 h.
+	return int(math.Round(due.Sub(today).Hours() / 24)), nil
+}
+
+// lastFiredRetention bounds how long debounce entries are kept. Keys such as
+// cc-due:<card>:<date> and sip-due:<sip>:<date> are unique per cycle, so
+// without pruning state.json grows forever. Anything older than the largest
+// window we care about (debounce, or the 6 h needs-login cooldown) is dead.
+const lastFiredRetention = 30 * 24 * time.Hour
+
+func (e *Engine) pruneLastFired(now time.Time) {
+	keep := lastFiredRetention
+	if d := time.Duration(e.cfg.DebounceMinutes) * time.Minute; d > keep {
+		keep = d
+	}
+	for k, t := range e.st.LastFired {
+		if now.Sub(t) > keep {
+			delete(e.st.LastFired, k)
+		}
 	}
 }
 

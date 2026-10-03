@@ -21,7 +21,7 @@ func MacBanner(title, subtitle, message string) error {
 		`subtitle (system attribute "INDW_SUBTITLE") ` +
 		`sound name "Submarine"`
 
-	cmd := exec.Command("osascript", "-e", script)
+	cmd := exec.Command("/usr/bin/osascript", "-e", script)
 	cmd.Env = append(cmd.Environ(),
 		"INDW_TITLE="+title,
 		"INDW_SUBTITLE="+subtitle,

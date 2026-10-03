@@ -27,6 +27,17 @@ type TokenSource interface {
 	AccessToken(ctx context.Context) (string, error)
 }
 
+// ForceRefresher is optionally implemented by a TokenSource that can replace
+// an access token the server rejected before its advertised expiry.
+type ForceRefresher interface {
+	ForceRefresh(ctx context.Context) error
+}
+
+// maxResponse caps how much of a single MCP response we buffer. Portfolio and
+// watchlist payloads are tens of KB; 16 MiB bounds memory if the upstream
+// misbehaves without truncating any realistic response.
+const maxResponse = 16 << 20
+
 func New(endpoint string, ts TokenSource) *Client {
 	return &Client{
 		endpoint:    endpoint,
@@ -163,6 +174,23 @@ func (c *Client) notify(ctx context.Context, method string, params any) error {
 }
 
 func (c *Client) do(ctx context.Context, body []byte) ([]byte, error) {
+	respBody, err := c.doOnce(ctx, body)
+	if err != ErrUnauthorized {
+		return respBody, err
+	}
+	// The token was rejected before its advertised expiry (revoked, or
+	// rotated by another process). Refresh once and retry.
+	fr, ok := c.tokenSource.(ForceRefresher)
+	if !ok {
+		return nil, err
+	}
+	if rerr := fr.ForceRefresh(ctx); rerr != nil {
+		return nil, fmt.Errorf("%w (refresh after 401: %w)", ErrUnauthorized, rerr)
+	}
+	return c.doOnce(ctx, body)
+}
+
+func (c *Client) doOnce(ctx context.Context, body []byte) ([]byte, error) {
 	tok, err := c.tokenSource.AccessToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get access token: %w", err)
@@ -185,9 +213,12 @@ func (c *Client) do(ctx context.Context, body []byte) ([]byte, error) {
 	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
 		c.sessionID = sid
 	}
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponse+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(respBody) > maxResponse {
+		return nil, fmt.Errorf("response exceeds %d bytes", maxResponse)
 	}
 	if resp.StatusCode == 401 {
 		return nil, ErrUnauthorized

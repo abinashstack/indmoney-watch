@@ -1,17 +1,19 @@
+//go:build !windows
+
 package store
 
 import (
-	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/abinashstack/indmoney-watch/internal/oauth"
 )
+
+// Location describes where tokens are stored, for user-facing messages.
+const Location = "macOS Keychain (service: indmoney-watch, account: tokens)"
 
 // Keychain stores tokens in macOS login keychain via the `security` CLI.
 // Service: indmoney-watch, Account: tokens.
@@ -22,6 +24,10 @@ var (
 	kcService = "indmoney-watch"
 	kcAccount = "tokens"
 )
+
+// securityBin is invoked by absolute path: it receives the token bundle on
+// stdin, so a `security` shim earlier in $PATH must never be picked up.
+const securityBin = "/usr/bin/security"
 
 // SaveTokens writes the token bundle to Keychain via `security -i` with the
 // secret encoded as a hex string passed to `-X`. Two reasons:
@@ -44,36 +50,33 @@ func SaveTokens(t *oauth.Tokens) error {
 	}
 	hexBlob := hex.EncodeToString(b)
 	// `security -i` accepts one command per line on stdin and exits on EOF.
-	// Delete first (security errors on duplicate without -U) then add with
-	// -U so an upgrade path also works. Service/account are fixed constants
-	// (no user input), so quoting them is unnecessary, but we keep them
-	// double-quoted for defense in depth in case the constants ever change.
+	// -U updates the item in place if it already exists, so there's no
+	// delete-then-add window in which a failed add would leave no tokens.
+	// Service/account are fixed constants (no user input), so quoting them is
+	// unnecessary, but we keep them double-quoted for defense in depth.
 	cmds := fmt.Sprintf(
-		"delete-generic-password -s %q -a %q\nadd-generic-password -s %q -a %q -U -X %s\n",
-		kcService, kcAccount,
+		"add-generic-password -s %q -a %q -U -X %s\n",
 		kcService, kcAccount, hexBlob,
 	)
-	cmd := exec.Command("security", "-i")
+	cmd := exec.Command(securityBin, "-i")
 	cmd.Stdin = strings.NewReader(cmds)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// Don't include `out` in errors — it may echo our argv.
-		// security -i prints "SecKeychainItemCreateFromContent ... -25299" if
-		// the delete failed because the item didn't exist; that's fine and
-		// the subsequent add-generic-password with -U will succeed. We only
-		// fail here if the *exec itself* failed.
+		// Don't include `out` in errors — it may echo our input, which
+		// carries the hex-encoded tokens, and errors end up in agent.log.
 		return fmt.Errorf("keychain save: %w", err)
 	}
-	// Treat unknown-error lines from the add (not the pre-delete) as failure.
+	// `security -i` exits 0 even when a sub-command fails; detect that from
+	// the output, again without echoing it.
 	if strings.Contains(string(out), "add-generic-password:") &&
-		strings.Contains(string(out), "error") {
-		return fmt.Errorf("keychain save: %s", strings.TrimSpace(string(out)))
+		strings.Contains(strings.ToLower(string(out)), "error") {
+		return fmt.Errorf("keychain save: add-generic-password failed")
 	}
 	return nil
 }
 
 func LoadTokens() (*oauth.Tokens, error) {
-	cmd := exec.Command("security", "find-generic-password",
+	cmd := exec.Command(securityBin, "find-generic-password",
 		"-s", kcService, "-a", kcAccount, "-w")
 	out, err := cmd.Output()
 	if err != nil {
@@ -84,36 +87,4 @@ func LoadTokens() (*oauth.Tokens, error) {
 		return nil, fmt.Errorf("decode tokens: %w", err)
 	}
 	return &t, nil
-}
-
-// TokenSource implements mcpclient.TokenSource — returns a fresh access token,
-// refreshing via the refresh_token grant when within 60 s of expiry.
-type TokenSource struct {
-	mu     sync.Mutex
-	tokens *oauth.Tokens
-}
-
-func NewTokenSource() (*TokenSource, error) {
-	t, err := LoadTokens()
-	if err != nil {
-		return nil, err
-	}
-	return &TokenSource{tokens: t}, nil
-}
-
-func (ts *TokenSource) AccessToken(ctx context.Context) (string, error) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	if time.Until(ts.tokens.ExpiresAt) > 60*time.Second {
-		return ts.tokens.AccessToken, nil
-	}
-	nt, err := oauth.Refresh(ctx, ts.tokens)
-	if err != nil {
-		return "", fmt.Errorf("refresh: %w", err)
-	}
-	if err := SaveTokens(nt); err != nil {
-		return "", fmt.Errorf("save refreshed: %w", err)
-	}
-	ts.tokens = nt
-	return nt.AccessToken, nil
 }

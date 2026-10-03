@@ -1,3 +1,5 @@
+//go:build !windows
+
 package store
 
 import (
@@ -16,7 +18,7 @@ import (
 //
 // Skipped automatically when /usr/bin/security is unavailable (non-macOS / CI).
 func TestKeychainRoundTripAdversarial(t *testing.T) {
-	if _, err := exec.LookPath("security"); err != nil {
+	if _, err := exec.LookPath(securityBin); err != nil {
 		t.Skip("security(1) not available")
 	}
 
@@ -25,7 +27,7 @@ func TestKeychainRoundTripAdversarial(t *testing.T) {
 	kcService = "indmoney-watch-test"
 	kcAccount = "tokens-test"
 	t.Cleanup(func() {
-		_ = exec.Command("security", "delete-generic-password",
+		_ = exec.Command(securityBin, "delete-generic-password",
 			"-s", kcService, "-a", kcAccount).Run()
 		kcService, kcAccount = origService, origAccount
 	})
@@ -45,7 +47,7 @@ func TestKeychainRoundTripAdversarial(t *testing.T) {
 
 	// Read back the raw stored blob via the CLI to verify we round-tripped
 	// the exact JSON we marshalled, not a shell-mangled version.
-	raw, err := exec.Command("security", "find-generic-password",
+	raw, err := exec.Command(securityBin, "find-generic-password",
 		"-s", kcService, "-a", kcAccount, "-w").Output()
 	if err != nil {
 		t.Fatalf("read raw: %v", err)

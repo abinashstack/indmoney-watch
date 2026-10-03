@@ -3,16 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/abinashstack/indmoney-watch/internal/alert"
 	"github.com/abinashstack/indmoney-watch/internal/config"
@@ -25,8 +25,10 @@ import (
 )
 
 const (
-	mcpEndpoint   = "https://mcp.indmoney.com/mcp"
-	launchdLabel  = "indmoney-watch"
+	mcpEndpoint  = "https://mcp.indmoney.com/mcp"
+	launchdLabel = "indmoney-watch"
+	// pollEvery is the launchd agent's cadence during market hours.
+	pollEvery = 10 * time.Minute
 )
 
 func usage() {
@@ -41,14 +43,15 @@ Usage:
   indw set-target SYMBOL below PRICE   Add price target (below)
   indw clear-target SYMBOL             Remove targets for a symbol
   indw run-once                        Single poll (alerts fire if thresholds hit)
-  indw start                           Install launchd agent (poll every 10 min, 09:00–16:00 IST)
-  indw stop                            Uninstall launchd agent
+  indw start                           Install background poller (launchd on macOS, Task Scheduler on Windows;
+                                       every 10 min, Mon–Fri 09:00–16:00 IST)
+  indw stop                            Uninstall background poller
   indw config                          Print config path and contents
-  indw logs [-f]                       Show launchd agent log (-f to follow)
+  indw logs [-f]                       Show background poller log (-f to follow)
   indw state                           Show last snapshot + debounce state
   indw paths                           Show all on-disk locations
   indw menubar                         Print SwiftBar menu plugin output (renders portfolio in macOS menu bar)
-  indw menubar install                 Install as a SwiftBar plugin (prompts to install SwiftBar if missing)`)
+  indw menubar install                 Install as a SwiftBar plugin (macOS only)`)
 	fmt.Fprintln(os.Stderr)
 }
 
@@ -75,7 +78,7 @@ func main() {
 	case "clear-target":
 		must(cmdClearTarget(args))
 	case "run-once":
-		must(cmdRunOnce(ctx))
+		must(cmdRunOnce(ctx, args))
 	case "start":
 		must(cmdStart())
 	case "stop":
@@ -118,19 +121,13 @@ func cmdLogin(ctx context.Context) error {
 		}
 	}
 	if !force {
-		if t, err := store.LoadTokens(); err == nil {
-			if time.Until(t.ExpiresAt) > 60*time.Second {
-				fmt.Println("Already logged in. Token valid until", t.ExpiresAt.Local().Format("2006-01-02 15:04 MST"))
+		// Go through TokenSource so a refresh here takes the same
+		// cross-process lock as the daemon and menu bar plugin.
+		if ts, err := store.NewTokenSource(); err == nil {
+			if _, err := ts.AccessToken(ctx); err == nil {
+				fmt.Println("Logged in. Token valid until", ts.ExpiresAt().Local().Format("2006-01-02 15:04 MST"))
 				fmt.Println("Use `indw login --force` to re-authenticate.")
 				return nil
-			}
-			if t.RefreshToken != "" {
-				if nt, rerr := oauth.Refresh(ctx, t); rerr == nil {
-					if serr := store.SaveTokens(nt); serr == nil {
-						fmt.Println("Refreshed existing session. Token valid until", nt.ExpiresAt.Local().Format("2006-01-02 15:04 MST"))
-						return nil
-					}
-				}
 			}
 			fmt.Println("Existing tokens expired and could not be refreshed; starting full login.")
 		}
@@ -151,7 +148,7 @@ func cmdLogin(ctx context.Context) error {
 	if err := store.SaveTokens(tokens); err != nil {
 		return err
 	}
-	fmt.Println("Logged in. Tokens stored in macOS Keychain (service: indmoney-watch).")
+	fmt.Println("Logged in. Tokens stored in", store.Location+".")
 	return nil
 }
 
@@ -188,13 +185,13 @@ func cmdStatus(ctx context.Context) error {
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "By asset type:")
 	for _, inv := range snap.Investments {
-		fmt.Fprintf(tw, "  %s\t₹%.0f\t%+.2f%%\n", inv.AssetType, inv.CurrentValue, inv.ReturnPercentage)
+		fmt.Fprintf(tw, "  %s\t₹%.0f\t%+.2f%%\n", termSafe(inv.AssetType), inv.CurrentValue, inv.ReturnPercentage)
 	}
 	if len(snap.Liabilities.CreditCards) > 0 {
 		fmt.Fprintln(tw)
 		fmt.Fprintln(tw, "Credit cards:")
 		for _, cc := range snap.Liabilities.CreditCards {
-			fmt.Fprintf(tw, "  %s\t₹%.2f due %s\n", cc.Name, cc.TotalDue, cc.DueDate)
+			fmt.Fprintf(tw, "  %s\t₹%.2f due %s\n", termSafe(cc.Name), cc.TotalDue, termSafe(cc.DueDate))
 		}
 	}
 	return tw.Flush()
@@ -221,8 +218,8 @@ func cmdWatchlist(ctx context.Context) error {
 			if details, err := api.IndianStockDetails(ctx, indKeys); err == nil {
 				for k, ent := range details {
 					fmt.Fprintf(tw, "IND\t%s\t%s\t₹%.2f\t%+.2f\t%s\n",
-						ent.Basic.Symbol, trunc(ent.Basic.Name, 30),
-						ent.Stats.LivePrice, ent.Stats.DayChangePct, k)
+						termSafe(ent.Basic.Symbol), trunc(ent.Basic.Name, 30),
+						ent.Stats.LivePrice, ent.Stats.DayChangePct, termSafe(k))
 				}
 			}
 		}
@@ -241,8 +238,8 @@ func cmdWatchlist(ctx context.Context) error {
 			if details, err := api.USStockDetails(ctx, tickers); err == nil {
 				for tkr, ent := range details {
 					fmt.Fprintf(tw, "US\t%s\t%s\t$%.2f\t%+.2f\t%s\n",
-						ent.Basic.Symbol, trunc(ent.Basic.Name, 30),
-						ent.Stats.LivePrice, ent.Stats.DayChangePct, tkr)
+						termSafe(ent.Basic.Symbol), trunc(ent.Basic.Name, 30),
+						ent.Stats.LivePrice, ent.Stats.DayChangePct, termSafe(tkr))
 				}
 			} else {
 				fmt.Fprintf(tw, "US\t-\tcouldn't fetch details (%v)\t\t\t\n", err)
@@ -309,7 +306,7 @@ func printSIPRow(tw *tabwriter.Writer, kind string, s indmoney.SIP) {
 		next = "-"
 	}
 	fmt.Fprintf(tw, "%s\t%s\t₹%.0f\t%s\t%s\t%s\n",
-		kind, trunc(s.DisplayName(), 32), s.AmountValue(), freq, next, status)
+		kind, trunc(s.DisplayName(), 32), s.AmountValue(), termSafe(freq), termSafe(next), status)
 }
 
 func cmdSetTarget(args []string) error {
@@ -355,12 +352,21 @@ func cmdClearTarget(args []string) error {
 	return config.Save(cfg)
 }
 
-func cmdRunOnce(ctx context.Context) error {
+func cmdRunOnce(ctx context.Context, args []string) error {
+	// --log appends output to agent.log. launchd redirects stdout/stderr
+	// itself; Task Scheduler can't, so the Windows task passes this flag.
+	for _, a := range args {
+		if a == "--log" {
+			if err := redirectToAgentLog(); err != nil {
+				return err
+			}
+		}
+	}
+
 	// Cap the entire cycle. The HTTP client has a 30 s per-request timeout but
 	// the engine fires ~10–20 sequential MCP calls, so a degraded upstream can
 	// otherwise drag a single run past the next launchd slot. 2 minutes is
-	// generous for a healthy poll and leaves headroom before the next 5 min
-	// fire.
+	// generous for a healthy poll and leaves headroom before the next fire.
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
@@ -384,8 +390,8 @@ func cmdRunOnce(ctx context.Context) error {
 	return nil
 }
 
-// notifyIfNeedsLogin surfaces oauth.ErrNeedsLogin to the user via a macOS
-// banner — once per 6h cooldown so the daemon doesn't spam every cycle while
+// notifyIfNeedsLogin surfaces oauth.ErrNeedsLogin to the user via a desktop
+// notification — once per 6h cooldown so the daemon doesn't spam every cycle while
 // the refresh token is dead. The original error is returned unchanged so the
 // launchd log still records the underlying cause.
 func notifyIfNeedsLogin(err error, st *state.State) error {
@@ -400,7 +406,7 @@ func notifyIfNeedsLogin(err error, st *state.State) error {
 	}
 	st.LastFired[key] = now
 	_ = state.Save(st)
-	_ = notify.MacBanner(
+	_ = notify.Banner(
 		"INDmoney session expired",
 		"Refresh token rejected",
 		"Run `indw login -f` to re-authenticate.",
@@ -423,173 +429,30 @@ func cmdConfig() error {
 	return nil
 }
 
-// ---- launchd ----
-
-// plistEscape XML-escapes a string for safe substitution inside a
-// <string>…</string> element of the launchd plist we generate. The two values
-// we substitute (`exe` from os.Executable, `logFile` under $HOME/.config) are
-// trusted in normal use, but a path containing `<` or `&` would corrupt the
-// plist, and a maliciously-crafted path could close the <string> tag and
-// inject directives like RunAtLoad=true. Defense in depth: cheaper to escape
-// every substitution than to reason about whether each input is safe.
-func plistEscape(s string) string {
-	var buf strings.Builder
-	_ = xml.EscapeText(&buf, []byte(s))
-	return buf.String()
-}
-
-func plistPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist"), nil
-}
-
-func cmdStart() error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	exe, _ = filepath.Abs(exe)
-	logDir, err := config.Dir()
-	if err != nil {
-		return err
-	}
-	logFile := filepath.Join(logDir, "agent.log")
-
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>%s</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>%s</string>
-    <string>run-once</string>
-  </array>
-  <key>StartCalendarInterval</key>
-  <array>
-%s
-  </array>
-  <key>StandardOutPath</key><string>%s</string>
-  <key>StandardErrorPath</key><string>%s</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
-  </dict>
-</dict>
-</plist>
-`, launchdLabel, plistEscape(exe), calendarSlots(), plistEscape(logFile), plistEscape(logFile))
-
-	pp, err := plistPath()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(pp), 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(pp, []byte(plist), 0o644); err != nil {
-		return err
-	}
-	// Bootstrap.
-	uid := os.Getuid()
-	target := fmt.Sprintf("gui/%d", uid)
-	_ = exec.Command("launchctl", "bootout", target, pp).Run()
-	out, err := exec.Command("launchctl", "bootstrap", target, pp).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("launchctl bootstrap: %w (%s)", err, strings.TrimSpace(string(out)))
-	}
-	fmt.Println("Installed launchd agent:", pp)
-	fmt.Println("Logs:", logFile)
-	fmt.Println("It will run every 5 minutes between 09:00–16:00 IST, Mon–Fri.")
-	return nil
-}
-
-func cmdStop() error {
-	pp, err := plistPath()
-	if err != nil {
-		return err
-	}
-	uid := os.Getuid()
-	target := fmt.Sprintf("gui/%d", uid)
-	_ = exec.Command("launchctl", "bootout", target, pp).Run()
-	if err := os.Remove(pp); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	fmt.Println("Removed launchd agent.")
-	return nil
-}
-
-// calendarSlots returns StartCalendarInterval entries for every 5 minutes
-// between 09:00 and 16:00 IST on Mon-Fri. macOS launchd uses local time,
-// so we offset for IST (+05:30) → local. The host's local TZ matters; we
-// emit IST minute-of-day slots based on the host's current offset.
-func calendarSlots() string {
-	// Convert IST hours to host-local hours.
-	// 09:00 IST → host local time of 09:00 IST.
-	istLoc, err := time.LoadLocation("Asia/Kolkata")
-	if err != nil {
-		istLoc = time.FixedZone("IST", 5*3600+30*60)
-	}
-	var sb strings.Builder
-	weekdays := []int{1, 2, 3, 4, 5} // Mon-Fri
-	// 09:00 to 15:55 IST in 5-min steps (last fire 15:55).
-	for h := 9; h <= 15; h++ {
-		for m := 0; m < 60; m += 5 {
-			istT := time.Date(2026, 1, 5, h, m, 0, 0, istLoc) // any Monday
-			localT := istT.Local()
-			for _, wd := range weekdays {
-				sb.WriteString(fmt.Sprintf(
-					"    <dict><key>Weekday</key><integer>%d</integer><key>Hour</key><integer>%d</integer><key>Minute</key><integer>%d</integer></dict>\n",
-					wd, localT.Hour(), localT.Minute(),
-				))
-			}
-		}
-	}
-	// One last slot at 16:00 IST.
-	istT := time.Date(2026, 1, 5, 16, 0, 0, 0, istLoc)
-	localT := istT.Local()
-	for _, wd := range weekdays {
-		sb.WriteString(fmt.Sprintf(
-			"    <dict><key>Weekday</key><integer>%d</integer><key>Hour</key><integer>%d</integer><key>Minute</key><integer>%d</integer></dict>\n",
-			wd, localT.Hour(), localT.Minute(),
-		))
-	}
-	return sb.String()
-}
-
+// trunc shortens s to at most n characters (runes, so multi-byte characters
+// are never split) and strips terminal control characters.
 func trunc(s string, n int) string {
-	if len(s) <= n {
+	s = termSafe(s)
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	r := []rune(s)
+	return string(r[:n-1]) + "…"
+}
+
+// termSafe replaces control characters (including ESC, which starts ANSI
+// sequences) with spaces, so names from INDmoney can't rewrite the terminal,
+// set its title, or break tabwriter columns.
+func termSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
 }
 
 // ---- inspection commands ----
-
-func cmdLogs(args []string) error {
-	d, err := config.Dir()
-	if err != nil {
-		return err
-	}
-	logFile := filepath.Join(d, "agent.log")
-	if _, err := os.Stat(logFile); os.IsNotExist(err) {
-		fmt.Println("(no log yet — agent hasn't run; use `indw start` to install it, or `indw run-once` to test)")
-		return nil
-	}
-	tailArgs := []string{"-n", "200"}
-	for _, a := range args {
-		if a == "-f" || a == "--follow" {
-			tailArgs = append(tailArgs, "-f")
-		}
-	}
-	tailArgs = append(tailArgs, logFile)
-	c := exec.Command("tail", tailArgs...)
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	return c.Run()
-}
 
 func cmdState() error {
 	d, err := config.Dir()
@@ -622,14 +485,13 @@ func cmdPaths() error {
 		return err
 	}
 	exe, _ := os.Executable()
-	pp, _ := plistPath()
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(tw, "binary\t%s\n", exe)
 	fmt.Fprintf(tw, "config dir\t%s\n", d)
 	fmt.Fprintf(tw, "config\t%s\n", filepath.Join(d, "config.yaml"))
 	fmt.Fprintf(tw, "state\t%s\n", filepath.Join(d, "state.json"))
 	fmt.Fprintf(tw, "agent log\t%s\n", filepath.Join(d, "agent.log"))
-	fmt.Fprintf(tw, "launchd plist\t%s\n", pp)
-	fmt.Fprintf(tw, "tokens\tmacOS Keychain (service: indmoney-watch, account: tokens)\n")
+	fmt.Fprintln(tw, schedulerLocation())
+	fmt.Fprintf(tw, "tokens\t%s\n", store.Location)
 	return tw.Flush()
 }

@@ -7,8 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/abinashstack/indmoney-watch/internal/config"
 	"github.com/abinashstack/indmoney-watch/internal/indmoney"
@@ -88,11 +92,12 @@ func menubarRender(ctx context.Context) error {
 		fmt.Printf("By asset class | color=%s\n", mb.HeaderColor)
 		for _, inv := range snap.Investments {
 			arrow := arrowFor(inv.ReturnPercentage)
-			fmt.Printf("  %s %s   ₹%s   %+.2f%% | color=%s font=Menlo\n",
+			line := fmt.Sprintf("  %s %s   ₹%s   %+.2f%%",
 				arrow,
 				padRight(inv.AssetType, 11),
 				commaINR(inv.CurrentValue),
-				inv.ReturnPercentage, pickColor(mb, inv.ReturnPercentage, false))
+				inv.ReturnPercentage)
+			fmt.Printf("%s | color=%s font=Menlo\n", sbEscape(line), pickColor(mb, inv.ReturnPercentage, false))
 		}
 	}
 
@@ -338,6 +343,9 @@ func arrowFor(pct float64) string {
 // menubarInstall drops a SwiftBar plugin that wraps `indw menubar`. Filename
 // encodes the refresh interval (`.10m.sh`) so SwiftBar polls every 10 min.
 func menubarInstall() error {
+	if runtime.GOOS != "darwin" {
+		return errors.New("the menu bar plugin needs SwiftBar, which is macOS-only; on " + runtime.GOOS + " use `indw status`, `indw watchlist` and the background poller (`indw start`)")
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -359,11 +367,16 @@ func menubarInstall() error {
 		return err
 	}
 
-	// Refresh cadence comes from config (e.g. "10m", "1s", "30s", "1h").
+	// Refresh cadence comes from config (e.g. "10m", "1s", "30s", "1h"). It
+	// becomes part of the plugin filename, so it must be strictly validated:
+	// a value like "../../x" would otherwise write the script elsewhere.
 	cfg, _ := config.Load()
 	cadence := "10m"
 	if cfg != nil && cfg.Menubar.RefreshInterval != "" {
 		cadence = cfg.Menubar.RefreshInterval
+	}
+	if !validCadence(cadence) {
+		return fmt.Errorf("menubar.refresh_interval %q is invalid: use a number followed by s, m, h or d (e.g. 10m)", cadence)
 	}
 	pluginPath := filepath.Join(pluginsDir, "indmoney."+cadence+".sh")
 	script := fmt.Sprintf(`#!/bin/bash
@@ -371,9 +384,8 @@ func menubarInstall() error {
 # <bitbar.version>0.1</bitbar.version>
 # <bitbar.author>indmoney-watch</bitbar.author>
 # <bitbar.desc>Portfolio + watchlist via INDmoney MCP</bitbar.desc>
-# <swiftbar.environment>[INDW_BIN=%s]</swiftbar.environment>
-exec "%s" menubar
-`, exe, exe)
+exec %s menubar
+`, shellQuote(exe))
 
 	// 0700: owner read/write/execute only. SwiftBar plugin scripts run with
 	// your indw binary on a timer, which means anyone who can write to this
@@ -403,7 +415,7 @@ exec "%s" menubar
 	} else {
 		fmt.Println("SwiftBar is installed. Either launch it or run:")
 		fmt.Println("  open -a SwiftBar")
-		_ = exec.Command("open", "-a", "SwiftBar").Start()
+		_ = exec.Command("/usr/bin/open", "-a", "SwiftBar").Start()
 	}
 	return nil
 }
@@ -455,24 +467,51 @@ func commaINR(v float64) string {
 	return out
 }
 
+// padRight pads s with spaces to n characters (runes, not bytes, so names
+// containing ₹ or other multi-byte characters still line up).
 func padRight(s string, n int) string {
-	if len(s) >= n {
+	l := utf8.RuneCountInString(s)
+	if l >= n {
 		return s
 	}
-	return s + strings.Repeat(" ", n-len(s))
+	return s + strings.Repeat(" ", n-l)
 }
 
-// sbEscape escapes characters SwiftBar treats specially in line text.
+// sbEscape neutralises characters SwiftBar treats specially in line text.
+// Text from INDmoney (names, asset types, error bodies) flows through here, so
+// it must not be able to start a new line or add attributes: a `|` would let
+// it append `bash=…` (command execution on click), and a newline would let it
+// emit an entirely new menu line. Control characters are replaced with spaces.
 func sbEscape(s string) string {
-	s = strings.ReplaceAll(s, "|", "¦")
-	return s
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '|':
+			return '¦'
+		case unicode.IsControl(r):
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+var cadenceRe = regexp.MustCompile(`^[1-9][0-9]{0,4}[smhd]$`)
+
+// validCadence reports whether v is a SwiftBar refresh interval that is safe
+// to embed in a filename.
+func validCadence(v string) bool {
+	return cadenceRe.MatchString(v)
+}
+
+// shellQuote single-quotes s for safe interpolation into a bash script.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // swiftbarPluginsDir reads SwiftBar's user-configured plugin directory from its
 // `defaults` store. Returns "" if not set. SwiftBar's bundle id is
 // `com.ameba.SwiftBar` and the key is `PluginDirectory`.
 func swiftbarPluginsDir() string {
-	out, err := exec.Command("defaults", "read", "com.ameba.SwiftBar", "PluginDirectory").Output()
+	out, err := exec.Command("/usr/bin/defaults", "read", "com.ameba.SwiftBar", "PluginDirectory").Output()
 	if err != nil {
 		return ""
 	}

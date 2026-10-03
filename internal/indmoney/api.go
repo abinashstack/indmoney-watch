@@ -115,17 +115,29 @@ type Watchlist struct {
 	Watchlists []WatchlistGroup `json:"watchlists"`
 }
 
-// AllStocks flattens entries across every named watchlist, deduplicating by
-// ind_key (a stock can appear in multiple watchlists).
+// AllStocks flattens entries across every named watchlist, deduplicating
+// (a stock can appear in multiple watchlists). Entries are keyed by ind_key,
+// falling back to ticker; an entry with neither is kept as-is. Keying on an
+// empty ind_key would collapse every ticker-only entry (e.g. US stocks) into
+// the first one.
 func (w *Watchlist) AllStocks() []WatchlistEntry {
 	seen := map[string]bool{}
 	var out []WatchlistEntry
 	for _, g := range w.Watchlists {
 		for _, s := range g.Stocks {
-			if seen[s.IndKey] {
-				continue
+			var key string
+			switch {
+			case s.IndKey != "":
+				key = "ind:" + s.IndKey
+			case s.Ticker != "":
+				key = "ticker:" + s.Ticker
 			}
-			seen[s.IndKey] = true
+			if key != "" {
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+			}
 			out = append(out, s)
 		}
 	}

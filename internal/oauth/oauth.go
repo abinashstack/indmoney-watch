@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,38 @@ const (
 // from launchd, hold up subsequent run-once cycles). 30 s is generous for an
 // OAuth endpoint while still letting users notice and Ctrl-C.
 var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+// maxBody caps how much of an OAuth endpoint response we read. Token and
+// registration responses are a few hundred bytes; 1 MiB is generous while
+// still bounding memory if the server misbehaves.
+const maxBody = 1 << 20
+
+// oauthErrCode matches a conservative subset of RFC 6749 error codes. Used
+// to decide whether a server- or URL-supplied error string is safe to echo
+// into logs (no newlines, no long attacker-controlled text).
+var oauthErrCode = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+
+// safeErrCode returns code if it looks like a plain OAuth error code, else a
+// placeholder. Never return raw response bodies from these endpoints: they
+// may contain tokens or client secrets, and errors end up in agent.log.
+func safeErrCode(code string) string {
+	if oauthErrCode.MatchString(code) {
+		return code
+	}
+	return "unrecognized_error"
+}
+
+// readOAuthError decodes the RFC 6749 §5.2 error code from a response body.
+func readOAuthError(rb []byte) string {
+	var oe struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(rb, &oe)
+	if oe.Error == "" {
+		return "no error code"
+	}
+	return safeErrCode(oe.Error)
+}
 
 // ClientCreds is the result of dynamic client registration.
 type ClientCreds struct {
@@ -73,16 +106,21 @@ func Register(ctx context.Context, redirectURI string) (*ClientCreds, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	rb, _ := io.ReadAll(resp.Body)
+	rb, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return nil, fmt.Errorf("register read: %w", err)
+	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("register http %d: %s", resp.StatusCode, string(rb))
+		return nil, fmt.Errorf("register http %d: %s", resp.StatusCode, readOAuthError(rb))
 	}
 	var c ClientCreds
 	if err := json.Unmarshal(rb, &c); err != nil {
-		return nil, fmt.Errorf("register decode: %w", err)
+		// Don't wrap err: json syntax errors can quote body fragments, and the
+		// body may carry client_secret.
+		return nil, errors.New("register: malformed response")
 	}
 	if c.ClientID == "" {
-		return nil, fmt.Errorf("register: empty client_id (body=%s)", string(rb))
+		return nil, errors.New("register: empty client_id")
 	}
 	return &c, nil
 }
@@ -124,46 +162,17 @@ func Login(ctx context.Context, creds *ClientCreds, redirectURI string) (*Tokens
 	authURL := AuthorizeURL + "?" + q.Encode()
 
 	// Start callback server.
-	type result struct {
-		code string
-		err  error
-	}
-	resCh := make(chan result, 1)
-	var once sync.Once
+	handler, resCh := callbackHandler(state)
 	srv := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/callback" {
-				http.NotFound(w, r)
-				return
-			}
-			gotState := r.URL.Query().Get("state")
-			code := r.URL.Query().Get("code")
-			errParam := r.URL.Query().Get("error")
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			if errParam != "" {
-				// errParam is attacker-controllable: anyone who can navigate the
-				// user's browser to http://127.0.0.1:47823/callback?error=… during
-				// the login window injects HTML otherwise. html.EscapeString covers
-				// the body context (& < > " ').
-				_, _ = io.WriteString(w, "<h1>Login failed</h1><p>"+html.EscapeString(errParam)+"</p>")
-				once.Do(func() { resCh <- result{err: fmt.Errorf("oauth error: %s", errParam)} })
-				return
-			}
-			if gotState != state {
-				_, _ = io.WriteString(w, "<h1>State mismatch</h1>")
-				once.Do(func() { resCh <- result{err: fmt.Errorf("state mismatch")} })
-				return
-			}
-			_, _ = io.WriteString(w, "<h1>Logged in. You can close this tab.</h1>")
-			once.Do(func() { resCh <- result{code: code} })
-		}),
+		ReadHeaderTimeout: 10 * time.Second,
+		Handler:           handler,
 	}
 	go func() { _ = srv.Serve(ln) }()
 
 	fmt.Printf("Opening browser for INDmoney login…\nIf it doesn't open, visit:\n  %s\n\n", authURL)
-	_ = exec.Command("open", authURL).Start()
+	_ = openBrowser(authURL)
 
-	var got result
+	var got callbackResult
 	select {
 	case got = <-resCh:
 	case <-ctx.Done():
@@ -186,6 +195,51 @@ func Login(ctx context.Context, creds *ClientCreds, redirectURI string) (*Tokens
 	tokens.ClientID = creds.ClientID
 	tokens.ClientSecret = creds.ClientSecret
 	return tokens, redirectURI, nil
+}
+
+// callbackResult is what the redirect handler reports back to Login.
+type callbackResult struct {
+	code string
+	err  error
+}
+
+// callbackHandler serves the OAuth redirect. It reports exactly one result on
+// the returned channel: the authorization code, or the error the
+// authorization server sent. Requests not carrying state are ignored.
+func callbackHandler(state string) (http.Handler, <-chan callbackResult) {
+	resCh := make(chan callbackResult, 1)
+	var once sync.Once
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/callback" {
+			http.NotFound(w, r)
+			return
+		}
+		gotState := r.URL.Query().Get("state")
+		code := r.URL.Query().Get("code")
+		errParam := r.URL.Query().Get("error")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// Anyone who can navigate the user's browser (i.e. any web page)
+		// can hit this endpoint during the login window. Requests that
+		// don't carry our state are rejected WITHOUT ending the flow, so a
+		// forged ?error= or ?state= can't abort a legitimate login.
+		if subtle.ConstantTimeCompare([]byte(gotState), []byte(state)) != 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, "<h1>State mismatch</h1><p>Ignored. Finish logging in from the original tab.</p>")
+			return
+		}
+		if errParam != "" {
+			_, _ = io.WriteString(w, "<h1>Login failed</h1><p>"+html.EscapeString(errParam)+"</p>")
+			once.Do(func() { resCh <- callbackResult{err: fmt.Errorf("oauth error: %s", safeErrCode(errParam))} })
+			return
+		}
+		if code == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, "<h1>Missing authorization code</h1>")
+			return
+		}
+		_, _ = io.WriteString(w, "<h1>Logged in. You can close this tab.</h1>")
+		once.Do(func() { resCh <- callbackResult{code: code} })
+	}), resCh
 }
 
 func exchangeCode(ctx context.Context, creds *ClientCreds, redirectURI, code, verifier string) (*Tokens, error) {
@@ -230,25 +284,21 @@ func tokenRequest(ctx context.Context, form url.Values) (*Tokens, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	rb, _ := io.ReadAll(resp.Body)
+	rb, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return nil, fmt.Errorf("token read: %w", err)
+	}
 	if resp.StatusCode >= 400 {
-		// Try to parse the standard OAuth error response (RFC 6749 §5.2). If
-		// the server says invalid_grant, the refresh token is dead and silent
+		// Parse the standard OAuth error response (RFC 6749 §5.2). If the
+		// server says invalid_grant, the refresh token is dead and silent
 		// recovery isn't possible — wrap ErrNeedsLogin so callers can match
-		// via errors.Is and trigger a re-login flow.
-		var oe struct {
-			Error            string `json:"error"`
-			ErrorDescription string `json:"error_description"`
+		// via errors.Is and trigger a re-login flow. Only the error code is
+		// surfaced; the body is never echoed because it ends up in agent.log.
+		code := readOAuthError(rb)
+		if code == "invalid_grant" {
+			return nil, fmt.Errorf("token http %d: %s: %w", resp.StatusCode, code, ErrNeedsLogin)
 		}
-		_ = json.Unmarshal(rb, &oe)
-		if oe.Error == "invalid_grant" {
-			desc := oe.ErrorDescription
-			if desc == "" {
-				desc = "refresh token rejected"
-			}
-			return nil, fmt.Errorf("token http %d: %s: %w", resp.StatusCode, desc, ErrNeedsLogin)
-		}
-		return nil, fmt.Errorf("token http %d: %s", resp.StatusCode, string(rb))
+		return nil, fmt.Errorf("token http %d: %s", resp.StatusCode, code)
 	}
 	var raw struct {
 		AccessToken  string `json:"access_token"`
@@ -258,7 +308,15 @@ func tokenRequest(ctx context.Context, form url.Values) (*Tokens, error) {
 		TokenType    string `json:"token_type"`
 	}
 	if err := json.Unmarshal(rb, &raw); err != nil {
-		return nil, fmt.Errorf("token decode: %w (body=%s)", err, string(rb))
+		// Never include the body or the decoder error: a successful token
+		// response carries access_token and refresh_token.
+		return nil, errors.New("token: malformed response")
+	}
+	if raw.AccessToken == "" {
+		return nil, errors.New("token: empty access_token")
+	}
+	if raw.TokenType != "" && !strings.EqualFold(raw.TokenType, "bearer") {
+		return nil, fmt.Errorf("token: unsupported token_type %q", safeErrCode(raw.TokenType))
 	}
 	return &Tokens{
 		AccessToken:  raw.AccessToken,

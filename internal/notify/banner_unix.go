@@ -1,3 +1,5 @@
+//go:build !windows
+
 package notify
 
 import (
@@ -6,7 +8,7 @@ import (
 	"strings"
 )
 
-// MacBanner fires a native macOS notification banner via osascript.
+// Banner fires a native macOS notification banner via osascript.
 //
 // Strings are passed through environment variables and read inside the
 // AppleScript via `system attribute`, NOT concatenated into the script body.
@@ -15,7 +17,7 @@ import (
 // escape the string literal because they're never substituted into the
 // script source. INDmoney is a trusted-but-still-untrusted upstream; defense
 // in depth is cheap here.
-func MacBanner(title, subtitle, message string) error {
+func Banner(title, subtitle, message string) error {
 	const script = `display notification (system attribute "INDW_MSG") ` +
 		`with title (system attribute "INDW_TITLE") ` +
 		`subtitle (system attribute "INDW_SUBTITLE") ` +

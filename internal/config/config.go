@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"gopkg.in/yaml.v3"
 )
@@ -133,12 +134,22 @@ func Defaults() *Config {
 	}
 }
 
+// Dir returns the per-user config directory, creating it if needed:
+// ~/.config/indmoney-watch on macOS/Linux, %AppData%\indmoney-watch on
+// Windows (where the folder is already private to the user by ACL; the
+// 0700 mode below only applies on Unix).
 func Dir() (string, error) {
-	home, err := os.UserHomeDir()
+	base, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	d := filepath.Join(home, ".config", "indmoney-watch")
+	base = filepath.Join(base, ".config")
+	if runtime.GOOS == "windows" {
+		if base, err = os.UserConfigDir(); err != nil {
+			return "", err
+		}
+	}
+	d := filepath.Join(base, "indmoney-watch")
 	if err := os.MkdirAll(d, 0o700); err != nil {
 		return "", err
 	}

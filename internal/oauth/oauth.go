@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
@@ -171,7 +170,7 @@ func Login(ctx context.Context, creds *ClientCreds, redirectURI string) (*Tokens
 	go func() { _ = srv.Serve(ln) }()
 
 	fmt.Printf("Opening browser for INDmoney login…\nIf it doesn't open, visit:\n  %s\n\n", authURL)
-	_ = exec.Command("/usr/bin/open", authURL).Start()
+	_ = openBrowser(authURL)
 
 	var got callbackResult
 	select {

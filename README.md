@@ -6,8 +6,8 @@
 
 [![CI](https://github.com/abinashstack/indmoney-watch/actions/workflows/ci.yml/badge.svg)](https://github.com/abinashstack/indmoney-watch/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/abinashstack/indmoney-watch/actions/workflows/codeql.yml/badge.svg)](https://github.com/abinashstack/indmoney-watch/actions/workflows/codeql.yml)
-[![Go](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
-[![Platform](https://img.shields.io/badge/Platform-macOS-000?logo=apple&logoColor=white)](https://www.apple.com/macos)
+[![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows-000)](#-quickstart)
 [![MCP](https://img.shields.io/badge/Protocol-MCP-7c3aed)](https://modelcontextprotocol.io)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Last commit](https://img.shields.io/github/last-commit/abinashstack/indmoney-watch?color=informational)](https://github.com/abinashstack/indmoney-watch/commits/main)
@@ -41,12 +41,13 @@
 | 🪙 **SIP alerts** | Failed installments (sticky transition), upcoming due dates, optional success confirmations |
 | 💳 **Credit-card warnings** | Configurable lead time before due dates |
 | 🍎 **macOS menu bar** | [SwiftBar](https://github.com/swiftbar/SwiftBar) plugin: live totals, watchlist hover-submenus, one-click actions |
-| ⏰ **Background daemon** | `launchd` agent polling Mon–Fri 09:00–16:00 IST, every 10 min by default |
-| 🔐 **OAuth 2.1 + PKCE + DCR** | Tokens in macOS Keychain — never on disk |
+| ⏰ **Background daemon** | `launchd` agent (macOS) or Task Scheduler task (Windows) polling Mon–Fri 09:00–16:00 IST, every 10 min by default |
+| 🪟 **Windows support** | Toast notifications, Task Scheduler poller, DPAPI-encrypted token storage (menu bar is macOS-only) |
+| 🔐 **OAuth 2.1 + PKCE + DCR** | Tokens in macOS Keychain, or DPAPI-encrypted on Windows — never in plaintext |
 
 ## 🚀 Quickstart
 
-> Requires **Go 1.22+** and **macOS**.
+> Requires **Go 1.26+** and **macOS** or **Windows 10 (1809+) / 11**.
 
 ```bash
 git clone https://github.com/abinashstack/indmoney-watch
@@ -56,6 +57,32 @@ indw login
 ```
 
 `indw login` opens a browser, completes OAuth against `mcp.indmoney.com`, and stashes tokens in your Keychain (service: `indmoney-watch`).
+
+<details>
+<summary><b>🪟 Windows</b></summary>
+
+In PowerShell:
+
+```powershell
+git clone https://github.com/abinashstack/indmoney-watch
+cd indmoney-watch
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\indw" | Out-Null
+go build -o "$env:LOCALAPPDATA\indw\indw.exe" ./cmd/indw
+& "$env:LOCALAPPDATA\indw\indw.exe" login
+& "$env:LOCALAPPDATA\indw\indw.exe" start   # register the background poller
+```
+
+(Add `%LOCALAPPDATA%\indw` to your user `PATH` to just type `indw`.)
+
+What's different on Windows:
+
+- **Tokens** are encrypted with DPAPI (bound to your Windows account) in `%AppData%\indmoney-watch\tokens.dpapi`.
+- **Alerts** are Windows toast notifications.
+- **`indw start`** registers a Task Scheduler task named `indmoney-watch` that runs hidden while you're logged on, including on battery. `indw stop` removes it.
+- **Config, state and logs** live in `%AppData%\indmoney-watch\` (`indw paths` shows them).
+- **No menu bar app** — SwiftBar is macOS-only. Use `indw status`, `indw watchlist` and `indw sips`.
+
+</details>
 
 <details>
 <summary><b>🍎 Add the menu-bar app (SwiftBar)</b></summary>
@@ -73,7 +100,7 @@ The plugin refreshes every 10 minutes by default (configurable via `menubar.refr
 <summary><b>⏰ Run the background alert daemon</b></summary>
 
 ```bash
-indw start    # installs launchd agent — polls Mon–Fri 09:00–16:00 IST every 10 min
+indw start    # installs launchd agent (Task Scheduler task on Windows) — polls Mon–Fri 09:00–16:00 IST every 10 min
 indw stop     # uninstalls
 indw logs -f  # tail the agent log
 ```
@@ -175,21 +202,22 @@ menubar:
 | `get_indian_stocks_details` / `get_us_stocks_details` | Live LTP + day change (capped at 10 ids/call, transparently chunked) |
 | `indian_stocks_sips` / `mf_sips` | SIP status, amounts, next execution |
 
-Polling state lives in `~/.config/indmoney-watch/state.json` (last-seen percentages and alert-firing timestamps for debouncing). OAuth tokens live in the macOS Keychain.
+Polling state lives in `~/.config/indmoney-watch/state.json` (`%AppData%\indmoney-watch\state.json` on Windows): last-seen percentages and alert-firing timestamps for debouncing. OAuth tokens live in the macOS Keychain, or in a DPAPI-encrypted file on Windows.
 
 ## 🤝 Contributing
 
 PRs welcome. Some directions if you're looking for ideas:
 
-- 🌐 **Cross-platform notifications** — currently uses `osascript` (macOS only). A Linux/Windows backend would open this up beyond Apple-land.
+- 🐧 **Linux support** — macOS and Windows are covered; Linux needs a notification backend (`notify-send`), a secret store (libsecret) and a systemd timer.
+- 🪟 **Windows tray icon** — the SwiftBar menu is macOS-only; a system-tray equivalent would round out Windows support.
 - 🔧 **More tools** — `lookup_ind_keys` for friendly target naming, 52-week high/low alerts, OHLC sparkline rendering in the menu bar.
 - ♻️ **Refactor `launchd` setup** — IST scheduling assumes the host TZ; a sleep-loop daemon mode would be more portable.
-- ✅ **Tests** — currently zero. The MCP layer is a good target.
+- ✅ **Tests** — `go test ./...` runs in CI on macOS and Windows; more coverage of the alert engine is welcome.
 
 When opening a PR:
 
 1. `go build ./...` should succeed cleanly.
-2. `go vet ./...` should pass.
+2. `go vet ./...` and `go test ./...` should pass.
 3. If you change MCP tool calls, mention the tool name + payload in the PR — INDmoney's contract isn't documented anywhere public, so reverse-engineered notes help.
 
 ## ⚠️ Caveats

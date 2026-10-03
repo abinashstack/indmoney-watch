@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"unicode"
@@ -342,6 +343,9 @@ func arrowFor(pct float64) string {
 // menubarInstall drops a SwiftBar plugin that wraps `indw menubar`. Filename
 // encodes the refresh interval (`.10m.sh`) so SwiftBar polls every 10 min.
 func menubarInstall() error {
+	if runtime.GOOS != "darwin" {
+		return errors.New("the menu bar plugin needs SwiftBar, which is macOS-only; on " + runtime.GOOS + " use `indw status`, `indw watchlist` and the background poller (`indw start`)")
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err

@@ -35,11 +35,13 @@ Out of scope:
 
 - The INDmoney MCP server itself (report to INDmoney)
 - Vulnerabilities in dependencies — we run `govulncheck` in CI and Dependabot for security updates; if you find something they miss, we still want to know
-- Issues that require local root or physical access (the threat model assumes a single-user macOS account)
+- Issues that require local root or physical access (the threat model assumes a single-user macOS or Windows account)
 
 ## Hardening notes for self-deployers
 
 - OAuth tokens live in macOS Keychain, not in files. **Limitation:** the item is created via `/usr/bin/security`, so its access list trusts that tool, and any process running as your user can read it without a prompt (`security find-generic-password -s indmoney-watch -w`). Keychain storage protects against other users and offline disk access, not against malware running in your own account. If that matters to you, open Keychain Access and restrict the `indmoney-watch` item's access control, or revoke the session from INDmoney after use.
+- On Windows, tokens are encrypted with DPAPI (`CryptProtectData`, bound to your Windows account, plus an application-specific entropy value) and stored in `%AppData%\indmoney-watch\tokens.dpapi`. As with the macOS Keychain, this protects against other users and offline disk access, not against malware running as you.
+- Windows toast notifications are rendered by Windows PowerShell with text passed through environment variables and XML-escaped — never spliced into the script — and the script itself is passed via `-EncodedCommand`. System binaries (`powershell.exe`, `schtasks.exe`, `conhost.exe`, `rundll32.exe`) are run from `%SystemRoot%\System32` by absolute path.
 - Token refreshes are serialised across processes (launchd poller, SwiftBar plugin, CLI) with a lock file in `~/.config/indmoney-watch/`, so concurrent refreshes can't burn a rotated refresh token.
 - Errors from the OAuth endpoints only ever report the OAuth error code, never the response body, so tokens and client secrets don't end up in `agent.log`. `agent.log` does contain alert text (holdings, P&L, card dues); it lives in the owner-only (`0700`) config directory.
 - Text from INDmoney (names, asset types, error bodies) is stripped of `|`, newlines and control characters before it reaches the SwiftBar plugin output or your terminal, so it can't add clickable `bash=` actions or emit terminal escape sequences.

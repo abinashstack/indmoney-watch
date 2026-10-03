@@ -20,7 +20,7 @@ type Engine struct {
 }
 
 func NewEngine(api *indmoney.API, cfg *config.Config, st *state.State) *Engine {
-	return &Engine{api: api, cfg: cfg, st: st, notify: notify.MacBanner}
+	return &Engine{api: api, cfg: cfg, st: st, notify: notify.Banner}
 }
 
 func (e *Engine) Run(ctx context.Context) error {

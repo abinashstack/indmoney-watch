@@ -163,52 +163,17 @@ func Login(ctx context.Context, creds *ClientCreds, redirectURI string) (*Tokens
 	authURL := AuthorizeURL + "?" + q.Encode()
 
 	// Start callback server.
-	type result struct {
-		code string
-		err  error
-	}
-	resCh := make(chan result, 1)
-	var once sync.Once
+	handler, resCh := callbackHandler(state)
 	srv := &http.Server{
 		ReadHeaderTimeout: 10 * time.Second,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/callback" {
-				http.NotFound(w, r)
-				return
-			}
-			gotState := r.URL.Query().Get("state")
-			code := r.URL.Query().Get("code")
-			errParam := r.URL.Query().Get("error")
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			// Anyone who can navigate the user's browser (i.e. any web page)
-			// can hit this endpoint during the login window. Requests that
-			// don't carry our state are rejected WITHOUT ending the flow, so a
-			// forged ?error= or ?state= can't abort a legitimate login.
-			if subtle.ConstantTimeCompare([]byte(gotState), []byte(state)) != 1 {
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = io.WriteString(w, "<h1>State mismatch</h1><p>Ignored. Finish logging in from the original tab.</p>")
-				return
-			}
-			if errParam != "" {
-				_, _ = io.WriteString(w, "<h1>Login failed</h1><p>"+html.EscapeString(errParam)+"</p>")
-				once.Do(func() { resCh <- result{err: fmt.Errorf("oauth error: %s", safeErrCode(errParam))} })
-				return
-			}
-			if code == "" {
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = io.WriteString(w, "<h1>Missing authorization code</h1>")
-				return
-			}
-			_, _ = io.WriteString(w, "<h1>Logged in. You can close this tab.</h1>")
-			once.Do(func() { resCh <- result{code: code} })
-		}),
+		Handler:           handler,
 	}
 	go func() { _ = srv.Serve(ln) }()
 
 	fmt.Printf("Opening browser for INDmoney login…\nIf it doesn't open, visit:\n  %s\n\n", authURL)
 	_ = exec.Command("/usr/bin/open", authURL).Start()
 
-	var got result
+	var got callbackResult
 	select {
 	case got = <-resCh:
 	case <-ctx.Done():
@@ -231,6 +196,51 @@ func Login(ctx context.Context, creds *ClientCreds, redirectURI string) (*Tokens
 	tokens.ClientID = creds.ClientID
 	tokens.ClientSecret = creds.ClientSecret
 	return tokens, redirectURI, nil
+}
+
+// callbackResult is what the redirect handler reports back to Login.
+type callbackResult struct {
+	code string
+	err  error
+}
+
+// callbackHandler serves the OAuth redirect. It reports exactly one result on
+// the returned channel: the authorization code, or the error the
+// authorization server sent. Requests not carrying state are ignored.
+func callbackHandler(state string) (http.Handler, <-chan callbackResult) {
+	resCh := make(chan callbackResult, 1)
+	var once sync.Once
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/callback" {
+			http.NotFound(w, r)
+			return
+		}
+		gotState := r.URL.Query().Get("state")
+		code := r.URL.Query().Get("code")
+		errParam := r.URL.Query().Get("error")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// Anyone who can navigate the user's browser (i.e. any web page)
+		// can hit this endpoint during the login window. Requests that
+		// don't carry our state are rejected WITHOUT ending the flow, so a
+		// forged ?error= or ?state= can't abort a legitimate login.
+		if subtle.ConstantTimeCompare([]byte(gotState), []byte(state)) != 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, "<h1>State mismatch</h1><p>Ignored. Finish logging in from the original tab.</p>")
+			return
+		}
+		if errParam != "" {
+			_, _ = io.WriteString(w, "<h1>Login failed</h1><p>"+html.EscapeString(errParam)+"</p>")
+			once.Do(func() { resCh <- callbackResult{err: fmt.Errorf("oauth error: %s", safeErrCode(errParam))} })
+			return
+		}
+		if code == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, "<h1>Missing authorization code</h1>")
+			return
+		}
+		_, _ = io.WriteString(w, "<h1>Logged in. You can close this tab.</h1>")
+		once.Do(func() { resCh <- callbackResult{code: code} })
+	}), resCh
 }
 
 func exchangeCode(ctx context.Context, creds *ClientCreds, redirectURI, code, verifier string) (*Tokens, error) {

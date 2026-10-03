@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly run on main: govulncheck can start failing with no code change
+  # when a new Go vulnerability is published, so don't wait for a push to
+  # find out.
+  schedule:
+    - cron: "17 5 * * 1"
+  # Allow on-demand runs from the Actions tab or the API.
+  workflow_dispatch:
 
 # Least privilege: CI only needs to read the repo.
 permissions:

@@ -8,6 +8,8 @@ on:
   schedule:
     # Re-scan main weekly so new query updates surface dormant issues.
     - cron: "37 6 * * 1"
+  # Allow on-demand scans from the Actions tab or the API.
+  workflow_dispatch:
 
 jobs:
   analyze:

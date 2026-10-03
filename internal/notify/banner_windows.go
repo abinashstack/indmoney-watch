@@ -18,8 +18,11 @@ import (
 // can't inject PowerShell. They are XML-escaped before going into the toast
 // template so they can't inject toast markup either. The notifier uses
 // PowerShell's own AppUserModelID, which is registered on every system, so
-// no Start-menu shortcut has to be installed first.
+// no Start-menu shortcut has to be installed first. Progress output is
+// silenced: with redirected output PowerShell otherwise writes progress
+// records ("Preparing modules for first use") to stderr as CLIXML.
 const toastScript = `$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
 function Esc([string]$s) { [System.Security.SecurityElement]::Escape($s) }

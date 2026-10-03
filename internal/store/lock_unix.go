@@ -21,7 +21,9 @@ func lockRefresh() (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(d, "refresh.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	// Read-only is enough to take the lock, and nothing is ever written to
+	// the file, so there is no data a failed Close could lose.
+	f, err := os.OpenFile(filepath.Join(d, "refresh.lock"), os.O_CREATE|os.O_RDONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
